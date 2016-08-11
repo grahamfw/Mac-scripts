@@ -1,0 +1,424 @@
+#!/bin/bash
+#
+# Script to go through the Airwatch (or likely any MDM) to Casper migration.
+# This script relies on APNS as well as AD certificates to authenticate users to 802.1x for wired and wireless.
+# The various sleeps and loops generally are waiting for APNS to do its thing. 
+#
+# You will want to bundle your wired and wireless profiles ahead of time in case APNS can't deliver them in a timely manner.
+#
+# NOTE: You will want to comment out sections around line 211. This pulls the email from a certificate in the login keychain,
+# based on your email domain, then later uses that to update the inventory record in the JSS. Deleting the cert kills the cert-based 802.1x auth,
+# which is why we try to validate connectivity to a staging VLAN afterwards. This may not apply to you!
+#
+# Written by Graham Wells
+# graham.wells@gmail.com
+# 7/13/2016
+# Rev. 8/11/2016
+# 
+# Computers must be on AD and in Casper for this to work!
+#
+## Set up variables - these can likely stay the same
+
+userName=$(/usr/bin/stat -f%Su /dev/console)
+logFile="/var/log/migration.log" 
+jamf="/usr/local/bin/jamf"
+
+########## Wired and wireless profile locations in case APNS takes too long...deliver these with Casper beforehand. ##########
+wiredNetworkConfigProfile="/var/sandbox/wired8021x-signed.mobileconfig"
+wirelessNetworkConfigProfile="/var/sandbox/wireless8021x-signed.mobileconfig"
+
+timestamp ()  { date "+%Y-%m-%d %H:%M:%S" ; }
+
+####################################### Update these variables to suit your environment #######################################
+
+hrSite="hr.domain.com"
+casper="jss.domain.com"
+pki="caserver.domain.com"
+domain="ad-domain.com"
+domainShortName="AD-DOMAIN"
+email="email-domain.com"
+
+###############################################################################################################################
+
+## Test AD connection by trying to look up the computer account- exit if this fails. 
+# Source: https://jamfnation.jamfsoftware.com/discussion.html?id=7039
+ad_computer_name=`dsconfigad -show | grep "Active Directory Domain" | awk '{print $5}'`
+# /usr/bin/dscl /Search read /Computers/$ad_computer_name > /dev/null 2>&1
+if [[ $ad_computer_name != "$domain" ]]; then
+	echo "$(timestamp) Computer either not properly connected to domain or is off of the corp network. Exiting..." >> $logFile
+	exit 6
+fi
+
+## Let's figure out which network adapter we care about 
+logicalAdapter=`/sbin/route get $casper | grep interface | awk '{print $2}'`
+if [[ $? != "0" ]]; then
+	echo "$(timestamp) Cannot reach Casper. Exiting..." >> $logFile
+	exit 4
+fi
+
+adapter=`/usr/sbin/networksetup -listallhardwareports | grep -B 1 $logicalAdapter | awk '/Hardware Port/ {print $3, $4}' | sed -e 's/[[:space:]]*$//'`
+
+## Function to call when we need to validate connectivity
+# 
+# Looks for $1 and $2 arguments.
+#
+# $1 values:
+#	casper
+#	hrSite
+#	pki
+#
+# $2 value: keepAlive
+# This will tell the function to NOT disable the wireless adapter and just sleep for the amount specified of time.
+#
+# Example:
+# validateConnectivity casper keepAlive
+# (keepAlive is optional)
+
+
+validateConnectivity () {
+	# Make sure arguments are valid
+	if [[ ! ($1 == "casper" || $1 == "hrSite" || $1 == "pki") ]]; then
+		echo "$(timestamp) validateConnectivity function missing primary argument. Exiting..."
+		exit 2
+	elif [[ $2 && $2 != "keepAlive" ]]; then
+		echo "$(timestamp) validateConnectivity function secondary argument is invalid. Exiting..."
+		exit 10
+	fi
+	if [[ $1 == "casper" ]]; then
+		nc -z $casper 8443 >/dev/null 2>&1
+		connectSuccess=$?
+		connectAttempts="0"
+		# Loop 5 times or until connectivity is verified; add bandsaw if it's not added, remove PublicWiFi, and give it 5 connection attempts after disabling/re-enabling airport	
+		until [[ $connectSuccess == "0" || $connectAttempts == "5" ]]; do
+			if [[ $adapter == "Wi-Fi" ]]; then
+				echo "$(timestamp) Trying to connect to Casper to validate a NAC'd connection..." >> $logFile
+				hasBandsaw=`/usr/sbin/networksetup -listpreferredwirelessnetworks $logicalAdapter | grep bandsaw`
+				if [[ ! $hasBandsaw ]]; then
+					/usr/sbin/networksetup -setairportnetwork $logicalAdapter bandsaw
+					echo "$(timestamp) Adding bandsaw to wi-fi adapter at $logicalAdapter..." >> $logFile
+				fi
+				if [[ $2 == "keepAlive" ]]; then
+					sleep 30
+					echo "$(timestamp) Sleeping 30 seconds. Will attempt $((4 - $connectAttempts)) more times..." >> $logFile
+				elif [[ $2 != "keepAlive" ]]; then
+					hasPublicWiFi=`/usr/sbin/networksetup -listpreferredwirelessnetworks $logicalAdapter | grep PublicWiFi`
+					if [[ $hasPublicWiFi ]]; then
+						/usr/sbin/networksetup -removepreferredwirelessnetwork $logicalAdapter PublicWiFi | sed "s/^/$(timestamp) /g" >> $logFile
+					fi
+					echo "$(timestamp) Enabling/disabling wireless to see if it reconnects. Attempt $(($connectAttempts + 1)) of 5..." >> $logFile
+					/usr/sbin/networksetup -setairportpower $logicalAdapter off >> $logFile
+					echo "$(timestamp) Disabled airport..." >> $logFile
+					/usr/sbin/networksetup -setairportpower $logicalAdapter on >> $logFile
+					echo "$(timestamp) Re-enabled airport and sleeping 15 seconds..." >> $logFile
+					sleep 15
+				fi
+				let "connectAttempts++"
+				nc -z $casper 8443 >/dev/null 2>&1
+				connectSuccess=$?
+			# Loop 5 times to get wired connection to come back online
+			elif [[ $adapter = *"Thunderbolt"* || $adapter = *"Ethernet"* || $adapter = *"USB"* ]]; then
+				echo "$(timestamp) Trying to connect to Casper to validate connectivity..." >> $logFile
+				nc -z $casper 8443 >/dev/null 2>&1
+				connectSuccess=$?
+				until [[ $connectSuccess == "0" || $connectAttempts == "5" ]]; do
+					let "connectAttempts++"
+					echo "$(timestamp) Attempt $connectAttempts of 5 to let 802.1x profile come down and connectivity to be verified. Will try again in 10 seconds..." >> $logFile
+					sleep 10
+					nc -z $casper 8443 >/dev/null 2>&1
+					connectSuccess=$?
+				done
+			else echo "$(timestamp) Did not find a suitable adapter. Check your script logic." >> $logFile
+				exit 1001
+			fi
+		done
+	elif [[ $1 == "hrSite" ]]; then
+		nc -z $hrSite 443 >/dev/null 2>&1
+		connectSuccess=$?
+		connectAttempts="0"
+		# Loop 5 times or until connectivity is verified; add bandsaw if it's not added, and give it 5 connection attempts after disabling/re-enabling airport	o
+		until [[ $connectSuccess == "0" || $connectAttempts == "5" ]]; do
+			if [[ $adapter == "Wi-Fi" ]]; then
+				echo "$(timestamp) Trying to connect to hrSite to validate a NAC'd connection..." >> $logFile
+				hasBandsaw=`/usr/sbin/networksetup -listpreferredwirelessnetworks $logicalAdapter| grep bandsaw`
+				if [[ ! $hasBandsaw ]]; then
+					/usr/sbin/networksetup -setairportnetwork $logicalAdapter bandsaw
+					echo "$(timestamp) Adding bandsaw to wi-fi adapter at $logicalAdapter..." >> $logFile
+				fi
+				if [[ $2 == "keepAlive" ]]; then
+					sleep 30
+					echo "$(timestamp) Sleeping 30 seconds. Will attempt $((4 - $connectAttempts)) more times..." >> $logFile
+				elif [[ $2 != "keepAlive" ]]; then
+					echo "$(timestamp) Enabling/disabling wireless to see if it reconnects. Attempt $(($connectAttempts + 1)) of 5..." >> $logFile
+					/usr/sbin/networksetup -setairportpower $logicalAdapter off >> $logFile
+					echo "$(timestamp) Disabled airport..." >> $logFile
+					/usr/sbin/networksetup -setairportpower $logicalAdapter on >> $logFile
+					echo "$(timestamp) Re-enabled airport and sleeping 15 seconds..." >> $logFile
+					sleep 15
+				fi
+				let "connectAttempts++"
+				nc -z $hrSite 443 >/dev/null 2>&1
+				connectSuccess=$?
+			elif [[ $adapter = *"Thunderbolt"* || $adapter = *"Ethernet"* || $adapter = *"USB"* ]]; then
+				echo "$(timestamp) Trying to connect to hrSite to validate connectivity..." >> $logFile
+				nc -z $hrSite 443 >/dev/null 2>&1
+				connectSuccess=$?
+				until [[ $connectSuccess == "0" || $connectAttempts == "5" ]]; do
+					let "connectAttempts++"
+					echo "$(timestamp) Attempt $connectAttempts of 5 for connectivity to be verified to hrSite. Will try again in 10 seconds..." >> $logFile
+					sleep 10
+					nc -z $hrSite 443 >/dev/null 2>&1
+					connectSuccess=$?
+				done
+			fi
+		done
+	elif [[ $1 == "pki" ]]; then
+		nc -z $pki 135  >/dev/null 2>&1
+		connectSuccess=$?
+		connectAttempts="0"
+		# Loop up to 5 times to hopefully allow connectivity to come back up or attempt to install the profile anyway
+		until [[ $connectSuccess == "0" || $connectAttempts == "5" ]]; do
+			echo "$(timestamp) Cannot reach CA server to request certificate. Sleeping 10 seconds and will try $(($connectAttempts-1)) more time(s)..." >> $logFile
+			sleep 10
+			nc -z $pki 135  >/dev/null 2>&1
+			connectSuccess=$?
+			let "connectAttempts++"
+		done
+	fi
+	if [[ $connectSuccess == "0" ]]; then
+		echo "$(timestamp) Connectivity to $1 validated..." >> $logFile
+		else echo "$(timestamp) Connectivity to $1 could not be validated after 5 attempts..." >> $logFile
+	fi
+}
+
+## Function to remove the MDM profile from AW or any other MDM solution.
+removeMDM () {
+	mdmUUID=`/usr/bin/profiles -Cv | grep -B 15 "Airwatch MDM" | awk -F ": " '/attribute: profileIdentifier/{print $NF}'`
+
+	if [[ ! $mdmUUID ]]; then
+		echo "$(timestamp) Machine does not appear to have an MDM profile. Getting Casper to manage this device..." >> $logFile
+		$jamf mdm | sed "s/^/$(timestamp) /g" >> $logFile
+		else echo "$(timestamp) User is currently enrolled in Airwatch or another MDM. Attempting to remove profile..." >> $logFile
+		/usr/bin/profiles -R -p $mdmUUID >> $logFile
+	if [[ $? != "0" ]]; then
+		echo "$(timestamp) MDM profile removal failed. Exiting..." >> $logFile
+		exit 2
+	fi
+
+	sleep 10
+
+	# Delete the AW certificate after capturing the emailAddress from it and archiving it to /var/sandbox
+
+	# Grab email from cert
+	emailAddress=`security find-certificate -a /Users/$userName/Library/Keychains/login.keychain | grep -B 15 AIRWATCHMDM | grep -m 1 \@$email\"$ | sed 's/"alis"<blob>="//g;s/"//g;s/[[:space:]]//g'`
+	echo "$(timestamp) Email address appears to be $emailAddress..." >> $logFile
+    sha1Hashes=$(security find-certificate -a -Z /Users/$userName/Library/Keychains/login.keychain | grep -B 5 \@$email\"$ | grep ^SHA-1 | awk '{print $3}')
+    exitCode=$?
+    sha1HashesArr=( ${sha1Hashes} )
+    
+	# Back up cert to /var/sandbox/$userName-cert.pem, then delete it
+	cert="/var/sandbox/$userName-cert.pem"
+	if [[ ${#sha1HashesArr[@]} -le "1" ]]; then
+    	security find-certificate -a -c $emailAddress -p /Users/$userName/Library/Keychains/login.keychain > $cert
+    	echo "$(timestamp) Captured sole certificate for $emailAddress and saved to $cert" >> $logFile
+    	else count="1"
+    	for c in ${sha1HashesArr[@]}; do
+    	    certAggregate="/var/sandbox/$userName-allcerts.pem"
+    	    cert="/var/sandbox/$userName-cert-$count.pem"
+    	    # security find-certificate -c $emailAddress -Z $c -p /Users/$userName/Library/Keychains/login.keychain > $cert
+    	    security find-certificate -a -c $emailAddress -p /Users/$userName/Library/Keychains/login.keychain > $certAggregate
+    	    cat $certAggregate | awk "/BEGIN/{i++}i==$count" | grep -B 45 END > $cert
+    	    echo "$(timestamp) Captured certificate number $count for $emailAddress and saved to $cert" >> $logFile 
+    	    let "count++"
+    	done
+    fi
+	# certificates=$(security find-certificate -a -c $emailAddress -Z /Users/$userName/Library/Keychains/login.keychain | grep ^SHA-1 | awk '{print $3}')
+	if [[ $exitCode == "0" ]]; then
+		# certificatesArr=( ${certificates} )
+    	for s in ${sha1HashesArr[@]}; do
+    		security delete-certificate -c $emailAddress -Z $s /Users/$userName/Library/Keychains/login.keychain  >> $logFile 
+    		if [[ $? == "0" ]]; then 
+    			echo "$(timestamp) Deleted certificate for $emailAddress. Success!" >> $logFile 
+    			else echo "$(timestamp) Was unable to remove certificate for $emailAddress..." >> $logFile 
+    		fi
+    	done
+    	else echo "$(timestamp) Did not find certificate for $emailAddress..." >> $logFile
+	fi
+
+	validateConnectivity casper
+
+	# Get JAMF to manage the device after profile removal, but only fail if WiFi.
+	$jamf mdm | sed "s/^/$(timestamp) /g" >> $logFile
+	if [[ $? != "0" && $adapter = "Wi-Fi" ]]; then
+		echo "$(timestamp) Something went wrong. Could not get mdm profile from Casper over Wi-Fi. Exiting..." >> $logFile
+		exit 1
+	fi
+	sleep 10 
+	echo "$(timestamp) Trying to allow the config profiles to come down..." >> $logFile
+	fi
+}
+
+## Deploy wireless network configuration if wireless adapter in use; Try to delete the AW certificates first
+if [[ $adapter = "Wi-Fi" ]]; then
+	
+	# Install the Casper-issued wireless config profile while still connected to bandsaw
+	echo "$(timestamp) Adapter is $adapter. Installing wireless configuration profile..." >> $logFile
+	/usr/bin/profiles -I -F $wirelessNetworkConfigProfile >> $logFile
+	exitCode=$?
+	while [[ $exitCode -ne "0" ]]; do
+		if [[ $remainingAttempts == "0" ]]; then
+			echo "$(timestamp) Could not install wireless profile for NAC. Exiting..." >> $logFile
+			exit 8
+		fi
+		sleep 5
+		echo "$(timestamp) Profile installation failed. Sleeping for 5 seconds and will reattempt $remainingAttempts more time(s)..." >> $logFile
+		let "remainingAttempts--"
+		/usr/bin/profiles -I -F $wirelessNetworkConfigProfile >> $logFile
+		exitCode=$?
+	done
+	
+	sleep 10
+	
+	## Remove Airwatch MDM profile and delete the 802.1x certificate used by AW
+	removeMDM
+fi
+
+## Install wired config profile only if Casper doesn't deliver one... Delete AW certificate after creating an archive.
+remainingAttempts="8"
+if [[ $adapter = *"Thunderbolt"* || $adapter = *"Ethernet"* || $adapter = *"USB"* ]]; then
+	# echo "$(timestamp) First, going to try to remove the AW certificate(s)..." >> $logFile
+	
+	jamfManged=`/usr/bin/profiles -Cv | grep JSS`
+	if [[ ! $jamfManaged ]]; then
+		
+		# Remove AW MDM profile
+		removeMDM
+
+		# Try to grab JAMF management framework, sleep 20, then installed the wired profile if it hasn't been pulled down yet
+		$jamf mdm | sed "s/^/$(timestamp) /g" >> $logFile
+		echo "$(timestamp) Sleeping 30 seconds to try to get 802.1x profile to come down..." >> $logFile
+		sleep 30
+		echo "$(timestamp) Validating connectivity to company PKI before proceeding..." >> $logFile
+		# Try to connect to CA to make sure certificate request will work
+		validateConnectivity pki
+		
+		# Try to connect to hrSite to validate connectivity, or install the profile manually
+		echo "$(timestamp) Trying to connect to hrSite to validate a NAC'd connection..." >> $logFile
+		validateConnectivity hrSite
+		$jamf mdm | sed "s/^/$(timestamp) /g" >> $logFile
+	   
+		if [[ $connectSuccess -ne "0" ]]; then
+			echo "$(timestamp) Cannot connect to hrSite. Installed wired profile manually..." >> $logFile
+			/usr/bin/profiles -I -F $wiredNetworkConfigProfile >> $logFile
+			exitCode=$?
+		fi
+		while [[ $exitCode -ne "0" ]]; do
+			if [[ $remainingAttempts == "0" ]]; then
+				echo "$(timestamp) Could not install wired profile for NAC. Exiting..." >> $logFile 
+				exit 8
+			fi
+			sleep 5
+			echo "$(timestamp) Profile installation failed. Sleeping for 5 seconds and will reattempt $remainingAttempts more time(s)..." >> $logFile 
+			let "remainingAttempts--"
+			/usr/bin/profiles -I -F $wiredNetworkConfigProfile >> $logFile
+			exitCode=$?
+		done
+	fi
+	
+	validateConnectivity casper 
+fi
+
+## Remove the profiles we manually installed if they exist
+wirelessUUID="D8CD0947-B02F-4A4F-B5A1-CA718575014E-mod"
+wirelessUUIDFromAPNS="D8CD0947-B02F-4A4F-B5A1-CA718575014E"
+wiredUUID="BC1621DE-D513-4258-9BC2-4D615C714A96-mod2"
+wirelessProfile=`/usr/bin/profiles -Cv | grep $wirelessUUID`
+wirelessProfileFromAPNS=`/usr/bin/profiles -Cv | grep $wirelessUUIDFromAPNS$`
+wiredProfile=`/usr/bin/profiles -Cv | grep $wiredUUID`
+
+validateConnectivity hrSite
+
+attempts="0"
+if [[ $adapter == "Wi-Fi" ]]; then
+	until [[ $wirelessProfile && $wirelessProfileFromAPNS || $attempts == "5" ]]; do
+		echo "$(timestamp) Profile not yet delivered by APNS... Sleeping 30 seconds." >> $logFile
+		sleep 30
+		wirelessProfileFromAPNS=`/usr/bin/profiles -Cv | grep $wirelessUUIDFromAPNS$`
+		let "attempts++"
+	done
+fi
+
+if [[ $wirelessProfileFromAPNS ]]; then
+    /usr/bin/profiles -R -p $wirelessUUID
+    echo "$(timestamp) Removed manually installed wireless profile..." >> $logFile
+    
+    validateConnectivity hrSite
+fi
+    
+if [[ $wiredProfile ]]; then
+	/usr/bin/profiles -R -p $wiredUUID
+	echo "$(timestamp) Removing wired profile we manually installed..." >> $logFile
+
+	validateConnectivity casper
+	
+	while [[ $connectSuccess != "0" || $attempts -ne "2" ]]; do
+    	validateConnectivity casper
+    	let "attempts++"
+    done
+fi
+
+## Remove Airwatch bits, unloading the agent first
+awRunning=`/bin/launchctl list | grep airwatch`
+if [[ $awRunning ]]; then
+	/bin/launchctl unload /Library/LaunchAgents/com.airwatch.mac.agent.plist
+	if [[ $? == 0 ]]; then
+		echo "$(timestamp) Unloaded Airwatch agent..." >> $logFile
+		else "$(timestamp) Was not able to unload Airwatch agent..." >> $logFile
+	fi
+	
+	# Kill Airwatch processes
+	awPIDs=`ps -ef | grep -i airwatch | egrep -vi "grep|jamf" | awk '{print $2}'`
+	awPIDsArr=( ${awPIDs} )
+	for p in ${awPIDsArr[@]}; do 
+	    kill -9 $p
+	done
+fi
+
+# Remove airwatch bits
+echo "$(timestamp) Deleting the following files..." >> $logFile
+rm -rfv /Library/Application\ Support/AirWatch* | sed "s/^/$(timestamp) /g" >> $logFile
+rm -rfv /Library/LaunchAgents/com.airwatch.mac.agent.plist | sed "s/^/$(timestamp) /g" >> $logFile
+rm -rfv /Library/LaunchDaemons/com.airwatch.*  | sed "s/^/$(timestamp) /g" >> $logFile
+rm -rfv /Applications/VMware\ AirWatch\ Agent.app | sed "s/^/$(timestamp) /g" >> $logFile
+/usr/local/bin/dockutil --remove 'company Catalog' --allhomes | sed "s/^/$(timestamp) /g" >> $logFile
+osascript -e 'tell application "VMware AirWatch Agent" to quit'
+
+# Populate the JSS username and email address from Airwatch certificate archived earlier; cycle through all certs with the same email address if they exist
+userID=`openssl x509 -in $cert -text -noout | grep "Subject: OU=AirWatchMDM" | awk '{print $6'} | sed 's/OU=//g;s/,//g'`
+if [[ ! $userID ]]; then
+    count="0"
+    certs=`ls /var/sandbox | grep "$userName-cert-"`
+    certsArr=( ${certs} )
+    until [[ $count == ${#sha1HashesArr[@]} || $userID ]]; do
+        # cert=`cat $certAggregate | awk "/BEGIN/{i++}i==$count" | grep -B 45 END`
+		userID=`openssl x509 -in /var/sandbox/${certsArr[$count]} -text -noout | grep "Subject: OU=AirWatchMDM" | awk '{print $6}' | sed 's/OU=//g;s/,//g'`
+        let "count++"
+    done
+fi
+            
+realName=`dscl /Active\ Directory/$domainShortName/All\ Domains -read /Users/$userID RealName | grep -v "RealName" | sed 's/^ //g'`
+
+if [[ $emailAddress && $userID && $realName ]]; then
+	$jamf recon -realname "$realName" -email "$emailAddress" -endUsername "$userID"
+	echo "$(timestamp) Updated JSS info with real name, userID, and email address." >> $logFile
+elif [[ $emailAddress && $userID ]]; then
+	$jamf recon -email "$emailAddress" -endUsername "$userID"
+	echo "$(timestamp) Updated JSS info with email address and userID. Real name was not available." >> $logFile
+elif [[ $emailAddress && $realName ]]; then
+	$jamf recon -email "$emailAddress" -realname "$realName"
+	echo "$(timestamp) Updated JSS info with email address and real name. UserID was not available." >> $logFile
+else echo "$(timestamp) emailAddress was not available..." >> $logFile
+fi
+
+# Remove System Prefs plist in case stale config profile data persists
+rm -rf /Users/$userName/Library/Preferences/com.apple.systempreferences.plist
+echo "$(timestamp) Deleted com.apple.systempreferences.plist from /Users/$userName/Library/Preferences. May need to restart for profiles to clear out of GUI..." >> $logFile
