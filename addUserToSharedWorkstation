@@ -1,0 +1,258 @@
+#!/bin/bash
+
+######################################################################################################
+#
+# Adapted from a script from JAMF Software to redirect the FV2 key to the JSS.
+#
+# This script will add another user to a shared workstation, so long as the current user is a local admin
+# and can unlock filevault. The NEW user will be able to unlock filevault by the end of this process.
+#
+# This script relies on Active Directory and mobile accounts to manage user credentials. It will check
+# the user's creds against AD and reprompt if they are incorrect (up to 3 times).
+#
+# We use jamfHelper for notifications and Applscript (osascript) for capturing the user input.
+# 
+# Mostly written by Graham Wells
+# graham.wells@gmail.com
+# 6/8/2016
+# Tested on 10.11.x
+#
+# Rev. 6/21/2016 - Rewrote the expect statement which passes the user password to fdesetup so special 
+# characters to not bomb the script.
+#
+######################################################################################################
+#  
+#
+########################### Edit these variables based on your environment ###########################
+
+adDomain="ad-domain.domain.com"
+adShortName="AD-DOMAIN" 
+companyName="Awesome Company" # Used in notifications to not scare the users
+companyShortName="awesomecompany" # Used in our dummy receipt name
+
+#####################################################################################################
+
+## Text Display Variables
+# Each time you call this, set jhTitle, jhHeading, and jhDescription, and optionally icon
+windowType="hud"		#	[hud | utility | fs]
+windowPostion="ul"			#	[ul | ll | ur | lr]
+jhTitle="Error"		#	"string"
+jhHeading=""			#	"string"
+jhDescription=""			#	"string"
+icon="/System/Library/CoreServices/Finder.app/Contents/Resources/Finder.icns"				#	path
+iconSize="128"				#	pixels
+countdown="3"					#	int
+timeout="$countdown"
+alignDescription="left"		#	[right | left | center | justified | natural]
+alignHeading="left" 				#	[right | left | center | justified | natural]
+
+## Get the target user's username, as well as the logged in user
+adminUser=$(/usr/bin/stat -f%Su /dev/console)
+userName="$(/usr/bin/osascript -e 'Tell application "System Events" to display dialog "Enter the username of the team member you would like to add to this computer:" default answer "" with title "Add Team Member" with text buttons {"Ok"} default button 1 ' -e 'text returned of result')"
+userName=`echo $userName | tr '[:upper:]' '[:lower:]'`
+
+## This first user check sees if the logged in account is already authorized with FileVault 2. Notify if not.
+adminCheck=`/usr/bin/fdesetup list | grep "^$adminUser"`
+
+if [[ ! $adminCheck ]]; then
+	echo "$adminUser is not a FileVault 2 enabled user."
+	# Set notification criteria and notify end user - leave newline and whitespace for jhHeading
+	jhHeading="FileVault 2 Error
+	        " ; jhDescription="$adminUser is not a FileVault 2 enabled user."	; icon="/System/Library/PreferencePanes/Security.prefPane/Contents/Resources/SystemPreferences_Security.tiff"
+	"/Library/Application Support/JAMF/bin/jamfHelper.app/Contents/MacOS/jamfhelper" -windowType "$windowType" -title "$jhTitle" -heading "$jhHeading" -description "$jhDescription" -countdown "$countdown" -icon "$icon" -iconSize "$iconSize" -alignDescription "$alignDescription" -alignHeading "$alignHeading"
+	exit 3
+	else echo "$adminUser is enabled for FileVault 2... Proceeding"
+fi
+
+## Make sure account is not already enabled for FV2, exit if it is
+fv2Check=`/usr/bin/fdesetup list | grep "^$userName"`
+if [[ $fv2Check ]]; then
+    echo "$userName already enabled for FileVault2. Exiting..."
+    # Set notification criteria and notify end user - leave newline and whitespace for jhHeading
+    jhHeading="FileVault 2 Error
+            " ; jhDescription="$userName is already enabled for FileVault 2 and should be able to log in."	; icon="/System/Library/PreferencePanes/Security.prefPane/Contents/Resources/SystemPreferences_Security.tiff"
+	"/Library/Application Support/JAMF/bin/jamfHelper.app/Contents/MacOS/jamfhelper" -windowType "$windowType" -title "$jhTitle" -heading "$jhHeading" -description "$jhDescription" -countdown "$countdown" -icon "$icon" -iconSize "$iconSize" -alignDescription "$alignDescription" -alignHeading "$alignHeading"
+    exit 1
+fi
+
+## Check AD bind status and look for user in AD
+adstatus=`/usr/sbin/dsconfigad -show | awk '/Active Directory Domain/{print $NF}'`
+userActive=`dscl /Active\ Directory/$adShortName/All\ Domains -read /Users/$userName dsAttrTypeNative:cn`
+
+if [[ $adstatus != "$adDomain" ]]; then
+    echo "Machine not bound to AD. Exiting..."
+    # Set notification criteria and notify end user - leave newline and whitespace for jhHeading
+    jhHeading="AD Bind Not Found        
+            " ; jhDescription="This computer must be bound to $adDomain to add new users.
+            
+Use The $companyName App Store to re-add your computer to the domain." ; icon="/System/Library/CoreServices/Applications/Directory Utility.app/Contents/Resources/DirectoryUtility.icns"
+	"/Library/Application Support/JAMF/bin/jamfHelper.app/Contents/MacOS/jamfhelper" -windowType "$windowType" -title "$jhTitle" -heading "$jhHeading" -description "$jhDescription" -countdown "$countdown" -icon "$icon" -iconSize "$iconSize" -alignDescription "$alignDescription" -alignHeading "$alignHeading"
+    exit 1
+fi
+
+## Loop until user enters an AD user or cancels
+while [[ ! $userActive ]]; do
+    userName="$(/usr/bin/osascript -e 'Tell application "System Events" to display dialog "User does not exist in AD. Enter the AD username of the team member you would like to add to this computer:" default answer "" with title "Add Team Member" with text buttons {"Cancel", "Ok"} default button "Ok" cancel button "Cancel"' -e 'text returned of result')"
+    if [[ $? -eq 1 ]]; then 
+        echo "$adminUser cancelled dialog box that requested AD username..."
+        exit 1
+    fi 
+    userActive=`dscl /Active\ Directory/$adShortName/All\ Domains -read /Users/"$userName" dsAttrTypeNative:cn`
+done
+
+## Capture new team member password and test credentials, looping until correct or three incorrect attempts
+userPass="$(/usr/bin/osascript -e 'Tell application "System Events" to display dialog "Please have the new team member enter his or her AD password" default answer "" with title "AD Password" with text buttons {"Ok"} default button 1 with hidden answer' -e 'text returned of result')"
+testNewUserCreds="$(/usr/bin/dscl /Active\ Directory/$adShortName/All\ Domains -authonly "$userName" "$userPass")"
+
+i=0
+while [[ $testNewUserCreds && $i -lt 3 ]]; do 
+    echo "Password incorrect for $userName..."
+    userPass="$(/usr/bin/osascript -e 'Tell application "System Events" to display dialog "Password is incorrect. Please have new team member re-enter his or her AD password" default answer "" with title "AD Password" with text buttons {"Cancel", "Ok"} default button "Ok" cancel button "Cancel" with hidden answer' -e 'text returned of result')"
+    if [[ $? -eq 1 ]]; then 
+        echo "User cancelled request window asking for new user's password after $((i+1)) attempt(s)..."
+        exit 1
+    fi
+    testNewUserCreds="$(/usr/bin/dscl /Active\ Directory/$adShortName/All\ Domains -authonly "$userName" "$userPass")"
+    i=$((i + 1))
+done
+
+if [[ $i -eq 3 ]]; then
+    echo "Three failed password attempts... exiting."
+    # Set notification criteria and notify end user - leave newline and whitespace for jhHeading
+    jhHeading="Incorrect Password        
+            " ; jhDescription="Your entered the password three times incorrectly.
+            
+Please check the password and rerun this process again." ; icon="/System/Library/CoreServices/Applications/Directory Utility.app/Contents/Resources/DirectoryUtility.icns"
+	"/Library/Application Support/JAMF/bin/jamfHelper.app/Contents/MacOS/jamfhelper" -windowType "$windowType" -title "$jhTitle" -heading "$jhHeading" -description "$jhDescription" -countdown "$countdown" -icon "$icon" -iconSize "$iconSize" -alignDescription "$alignDescription" -alignHeading "$alignHeading"
+    exit 1
+fi
+
+## Check to see if the encryption process is complete
+encryptCheck=`fdesetup status`
+statusCheck=$(echo "${encryptCheck}" | grep "FileVault is On.")
+expectedStatus="FileVault is On."
+if [ "${statusCheck}" != "${expectedStatus}" ]; then
+	echo "The encryption process has not completed."
+	echo "${encryptCheck}"
+	# Set notification criteria and notify end user - leave newline and whitespace for jhHeading
+    jhHeading="Encryption Error    
+            " ; jhDescription="Encryption process has not yet completed.
+            
+Please allow your device to finish encrypting and try to add a user again." ; icon="/System/Library/PreferencePanes/Security.prefPane/Contents/Resources/SystemPreferences_Security.tiff"
+	"/Library/Application Support/JAMF/bin/jamfHelper.app/Contents/MacOS/jamfhelper" -windowType "$windowType" -title "$jhTitle" -heading "$jhHeading" -description "$jhDescription" -countdown "$countdown" -icon "$icon" -iconSize "$iconSize" -alignDescription "$alignDescription" -alignHeading "$alignHeading"
+	exit 4
+fi
+
+## Get the logged in user's password via a prompt
+echo "Prompting $adminUser for their login password."
+adminPass="$(/usr/bin/osascript -e 'Tell application "System Events" to display dialog "Please enter password for the current logged in user:" default answer "" with title "Login Password" with text buttons {"Ok"} default button 1 with hidden answer' -e 'text returned of result')"
+
+## Check password against correct authentication authority - local for local users, AD for mobile accounts
+authDomain=`dscl . read /Users/"$adminUser" OriginalAuthenticationAuthority`
+if [[ $authDomain ]]; then
+    testAdminUserCreds="$(/usr/bin/dscl /Active\ Directory/$adShortName/All\ Domains -authonly "$adminUser" "$adminPass")"
+    else testAdminUserCreds="$(/usr/bin/dscl /Local/Default -authonly "$adminUser" "$adminPass")"
+fi
+
+## Give user three chances to enter a correct password, hitting the correct auth authority, exit if user cancels
+i=0
+while [[ $testAdminUserCreds && $i -lt 3 ]]; do 
+    echo "Password incorrect for $adminUser..."
+    adminPass="$(/usr/bin/osascript -e 'Tell application "System Events" to display dialog "Password is incorrect. Please enter your current login password" default answer "" with title "Login Password" with text buttons {"Cancel", "Ok"} default button "Ok" cancel button "Cancel" with hidden answer' -e 'text returned of result')"
+    if [[ $? -eq 1 ]]; then 
+        echo "User cancelled request window asking for new user's password after $((i+1)) attempt(s)..."
+        exit 1
+    fi
+    if [[ $authDomain ]]; then
+        testAdminUserCreds="$(/usr/bin/dscl /Active\ Directory/$adShortName/All\ Domains -authonly "$adminUser" "$adminPass")"
+        else testAdminUserCreds="$(/usr/bin/dscl /Local/Default -authonly "$adminUser" "$adminPass")"
+    fi
+    i=$((i + 1))
+done
+
+if [[ $i -eq 3 ]]; then
+    echo "Three failed password attempts... exiting."
+    # Set notification criteria and notify end user - leave newline and whitespace for jhHeading
+    jhHeading="Incorrect Password        
+            " ; jhDescription="Your entered the password three times incorrectly.
+            
+Please check the password and rerun this process again." ; icon="/System/Library/CoreServices/Applications/Directory Utility.app/Contents/Resources/DirectoryUtility.icns"
+	"/Library/Application Support/JAMF/bin/jamfHelper.app/Contents/MacOS/jamfhelper" -windowType "$windowType" -title "$jhTitle" -heading "$jhHeading" -description "$jhDescription" -countdown "$countdown" -icon "$icon" -iconSize "$iconSize" -alignDescription "$alignDescription" -alignHeading "$alignHeading"
+    exit 1
+fi
+
+## Create Mobile Account for new team member, if account doesn't exist - matches literal from beginning of line to end of line to exclude la-, ca-, etc. accounts
+userExist=`/usr/bin/dscl . -list /Users | grep "^$userName$"`
+if [[ ! $userExist ]]; then
+    echo "User does not exist... creating mobile account for $userName"
+    /System/Library/CoreServices/ManagedClient.app/Contents/Resources/createmobileaccount -n "$userName" -p "$userPass"
+    else echo "$userName already has an account..."
+fi
+
+## Add user to admin group
+isAdmin=`/usr/bin/dscl . -read /Groups/admin GroupMembership | grep -w $userName`
+if [[ ! $isAdmin ]]; then
+    echo "Adding $userName to admins group..."
+    /usr/sbin/dseditgroup -o edit -a $userName -t user admin
+fi
+
+## This "expect" block will populate answers for the fdesetup prompts that normally occur while hiding them from output
+#expect -c "
+#log_user 0
+#spawn fdesetup add -usertoadd $userName
+#expect \"Enter a password for '/', or the recovery key:\"
+#send ${adminPass}\r
+#expect \"Enter the password for the added user '$userName':\"
+#send ${userPass}\r
+#log_user 1
+#expect eof
+#"
+
+## Rewrote this expect statement with Chris Layton's immense help. Expect gets complain-y if too many arguments are passed.
+{
+# set -x
+cat > /tmp/runfile.$$ << "EOF"
+set arg0 [lindex $argv 0]
+set arg1 [lindex $argv 1]
+set arg2 [lindex $argv 2]
+spawn fdesetup add -usertoadd $arg2
+expect "\"Enter a password for '/', or the recovery key:\""
+send "$arg1\r"
+expect "\"Enter the password for the added user '$arg2':\""
+send "$arg0\r"
+log_user 1
+expect eof
+exit
+EOF
+
+chmod +x /tmp/runfile.$$
+expect -f /tmp/runfile.$$ $userPass $adminPass $userName
+rm -rf /tmp/runfile.$$
+}
+
+## Create dummy receipt for identifying shared workstations - can key off of this in Casper
+/usr/bin/touch /var/sandbox/com.$companyShortName.sharedworkstation.plist
+
+
+fv2Check=`/usr/bin/fdesetup list | grep "^$userName"`
+if [[ $fv2Check ]]; then
+    echo "$userName has been added to FileVault 2. Success!"
+    jhTitle="Success"
+    jhHeading="User has been successfully added.      
+            " ; jhDescription="$userName has been added to FileVault 2 and made an admin on this box.
+            
+Please reboot and have $userName attempt to log in. You will need to reboot when switching users for now." ; icon="/System/Library/CoreServices/Finder.app/Contents/Resources/Finder.icns"
+	"/Library/Application Support/JAMF/bin/jamfHelper.app/Contents/MacOS/jamfhelper" -windowType "$windowType" -title "$jhTitle" -heading "$jhHeading" -description "$jhDescription" -countdown "$countdown" -icon "$icon" -iconSize "$iconSize" -alignDescription "$alignDescription" -alignHeading "$alignHeading" &
+    else jhTitle="Error"
+    echo "User has not been successfully added to FileVault 2."
+    jhHeading="User has NOT been added.      
+            " ; jhDescription="$userName has not been successfully added.
+            
+Please contact an administrator to check the logs to see what went wrong." ; icon="/System/Library/CoreServices/Finder.app/Contents/Resources/Finder.icns"
+	"/Library/Application Support/JAMF/bin/jamfHelper.app/Contents/MacOS/jamfhelper" -windowType "$windowType" -title "$jhTitle" -heading "$jhHeading" -description "$jhDescription" -countdown "$countdown" -icon "$icon" -iconSize "$iconSize" -alignDescription "$alignDescription" -alignHeading "$alignHeading" &
+    exit 1
+fi
+
+exit 0
+
+
