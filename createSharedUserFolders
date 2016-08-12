@@ -1,0 +1,180 @@
+#!/bin/bash
+#
+# This script will redirect all new users home folders to the folders on /Users/Shared for 
+# shared workstations. These should be fresh out-of-the-box devices.
+#
+# The script will redirect the current folders (preserving the content of those folders),
+# as well as any new users added to the computer. 
+#
+# Written by Graham Wells
+# Vers. 1.0, 6/3/2016
+# Rev.  6/9/2016 - Using for loops to use the actual source folder names in each one instead of hard coding them
+#       6/15/2016 - Added logic to copy the user files in the home directory and create symlinks for the original user, akin to what new users see
+#	      6/29/2016 - Added a line to create a workspaces folder used by many development applications.
+#
+# Instantiate variables
+newHome="/Users/Shared/"
+templateDir="/System/Library/User Template/"
+template="English.lproj/"
+non_localized="/System/Library/User Template/Non_localized/"
+userName=$(/usr/bin/stat -f%Su /dev/console)
+
+# Backup existing English.lproj folder and Non_localized folder
+if [ ! -d "$templateDir""EnglishBAK.lproj" ]; then
+	cp -R "$templateDir$template" "$templateDir""EnglishBAK.lproj"
+	echo "Backing up English.lproj..."
+	else echo "EnglishBAK.lproj already exists..."
+fi
+
+if [ ! -d "$templateDir""Non_localizedBAK" ]; then
+	cp -R "$non_localized" "$templateDir""Non_localizedBAK"
+	echo "Backing up Non_localized..."
+	else echo "Non_localizedBAK already exists..."
+fi
+
+# Get contents of English.lproj and non_localized dirs
+localizedDirs=$(ls -d /System/Library/User\ Template/English.lproj/*/ | sed 's/\/System\/Library\/User[[:space:]]Template\/English\.lproj\///g')
+localizedArr=( ${localizedDirs} )
+
+nonlocalizedDirs=$(ls -d /System/Library/User\ Template/Non_localized/*/ | sed 's/\/System\/Library\/User[[:space:]]Template\/Non_localized\///g')
+nonlocalizedArr=( ${nonlocalizedDirs} )
+
+# Remove trailing slash from foldername
+cnt=0
+for i in ${localizedArr[@]}; do 
+	localizedArr[$cnt]=$(echo ${localizedArr[$cnt]} | sed 's:/*$::')
+	cnt=$[${cnt} +1]
+done
+
+cnt=0
+for i in ${nonlocalizedArr[@]}; do 
+	nonlocalizedArr[$cnt]=$(echo ${nonlocalizedArr[$cnt]} | sed 's:/*$::')
+	cnt=$[${cnt} +1]
+done
+
+# Backup English.lproj and Non_localized parent dirs
+if [ ! -d "$templateDir""EnglishBAK.lproj" ]; then
+	cp -R "$templateDir$template" "$templateDir""EnglishBAK.lproj"
+	echo "Backing up English.lproj..."
+	else echo "EnglishBAK.lproj already exists..."
+fi
+
+if [ -d "$templateDir""Non_localized" ]; then
+	cp -R "$non_localized" "$templateDir""Non_localizedBAK"
+	echo "Backing up Non_localized..."
+	else echo "Non_localizedBAK already exists..."
+fi
+
+# Create new folders in /Users/Shared/
+if [ ! -d $newHome ]; then
+	mkdir $newHome
+	echo "Creating $newHome..."
+	else echo "$newHome already exists..."
+fi
+
+# For each folder that exists in English.lproj, delete it, create that folder in /Users/Shared, then create symlink to it
+for i in ${localizedArr[@]}; do
+	if [[ $i != "Library" ]]; then
+		rm -rf "$templateDir""$template""$i"
+		echo "Deleted $templateDir$template$i"
+		mkdir "$newHome""$i"
+		echo "Created $newHome$i"
+		ln -sFfh "$newHome""$i" "$templateDir$template""$i"
+		echo "Created symlink for $newHome$i in $templateDir$template$i"
+	fi
+done
+
+# Do same thing for Non_localized directories
+for i in ${nonlocalizedArr[@]}; do
+	if [[ $i != "Library" ]]; then
+		rm -rf "$non_localized""$i"
+		echo "Deleted $non_localized$i"
+		mkdir "$newHome""$i"
+		echo "Created $newHome$i"
+		ln -sFfh "$newHome""$i" "$non_localized""$i"
+		echo "Created symlink for $newHome$i in $non_localized$i"
+	fi
+done
+
+# Copy contents of user who ran the this script to their contents to the template folders
+localUserDirs=$(ls -d /Users/"$userName"/*/)
+localUserDirsArr=( ${localUserDirs} )
+localUserDirsName=$(cd /Users/"$userName"/ ; ls -d */ )
+localUserDirsNameArr=( ${localUserDirsName} )
+
+# Remove trailing slash
+cnt=0
+for i in ${localUserDirsArr[@]}; do 
+	localUserDirsArr[$cnt]=$(echo ${localUserDirsArr[$cnt]} | sed 's:/*$::')
+	cnt=$[${cnt} +1]
+done
+
+cnt=0
+for i in ${localUserDirsNameArr[@]}; do 
+	localUserDirsNameArr[$cnt]=$(echo ${localUserDirsNameArr[$cnt]} | sed 's:/*$::')
+	cnt=$[${cnt} +1]
+done
+
+# Copy the contents of the files, excluding Library, when the folder names match (e.g. copy contents of Documents to $newHome/Documents, etc.)
+for i in ${localUserDirsArr[@]}; do
+        if [[ $i != *"Library"* ]]; then
+                for d in ${localUserDirsNameArr[@]}; do
+                        if [[ $i = *"$d"* ]] && [[ $d != *"Library"* ]]; then
+                                echo "Trying to copy $i contents to $newHome$d"
+                                if [[ ! -d "$newHome""$d" ]]; then
+                                        mkdir "$newHome""$d"
+                                fi
+                                h=$(echo $i | sed 's/ /\\ /g')
+                                e=$(echo $d | sed 's/ /\\ /g')
+                                rsync -av --exclude=".*" "$h/" "$newHome""$e"
+                        fi
+                done
+        fi
+done
+
+# Copy any files they may have in home directory to /Users/Shared, removing spaces and replacing with zrcdgr - random string
+localUserFiles=$(find /Users/$userName -type f -maxdepth 1 \( ! -iname ".*" \) | sed 's/\.\///g' | sed 's/ /zrcdgr/g')
+localUserFilesArr=( ${localUserFiles} )
+
+for i in ${localUserFilesArr[@]}; do
+        i=$(echo $i | sed 's/zrcdgr/ /g')
+        cp "$i" "$newHome"
+done
+
+# Delete old user folders and create symlinks to folders in /Users/Shared, if not already done
+if [[ ! -h /Users/"$userName"/Documents ]]; then
+    for l in ${nonlocalizedArr[@]}; do
+            if [[ $l != "Library" ]]; then
+                    rm -rf /Users/"$userName"/"$l"
+                    ln -sFfh "$newHome""$l" /Users/"$userName"/"$l"
+            fi
+    done
+
+    for l in ${localizedArr[@]}; do
+            if [[ $l != "Library" ]]; then
+                    rm -rf /Users/"$userName"/"$l"
+                    ln -sFfh "$newHome""$l" /Users/"$userName"/"$l"
+            fi
+    done
+fi
+
+# Create workspaces folder at request of devs
+mkdir "$newHome""workspaces"
+
+# Make sure symlink for workspaces exists in user template
+ln -sFfh "$newHome""workspaces" "$templateDir""$template""workspaces"
+
+# Grant everyone read/write/execute on the directory
+chmod -R 777 $newHome
+echo "Granted everyone read/write/execute on $newHome"
+
+# Create brewers group for homebrew users
+#hasBrewers=`/usr/bin/dscl . read /Groups/brewers`
+#if [[ ! $hasBrewers ]]; then
+#    echo "Creating /Groups/brewers..."
+#    /usr/bin/dscl . create /Groups/brewers
+#    /usr/bin/dscl . create /Groups/brewers Realname "Brewers"
+#    /usr/bin/dscl . create /Groups/brewers gid 550
+#fi
+
+exit 0
