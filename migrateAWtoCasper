@@ -37,6 +37,7 @@ pki="caserver.domain.com"
 domain="ad-domain.com"
 domainShortName="AD-DOMAIN"
 email="email-domain.com"
+wirelessSSID="corpwireless"
 
 ###############################################################################################################################
 
@@ -88,14 +89,14 @@ validateConnectivity () {
 		nc -z $casper 8443 >/dev/null 2>&1
 		connectSuccess=$?
 		connectAttempts="0"
-		# Loop 5 times or until connectivity is verified; add bandsaw if it's not added, remove PublicWiFi, and give it 5 connection attempts after disabling/re-enabling airport	
+		# Loop 5 times or until connectivity is verified; add corpwireless if it's not added, remove PublicWiFi, and give it 5 connection attempts after disabling/re-enabling airport	
 		until [[ $connectSuccess == "0" || $connectAttempts == "5" ]]; do
 			if [[ $adapter == "Wi-Fi" ]]; then
 				echo "$(timestamp) Trying to connect to Casper to validate a NAC'd connection..." >> $logFile
-				hasBandsaw=`/usr/sbin/networksetup -listpreferredwirelessnetworks $logicalAdapter | grep bandsaw`
-				if [[ ! $hasBandsaw ]]; then
-					/usr/sbin/networksetup -setairportnetwork $logicalAdapter bandsaw
-					echo "$(timestamp) Adding bandsaw to wi-fi adapter at $logicalAdapter..." >> $logFile
+				hasCorpWireless=`/usr/sbin/networksetup -listpreferredwirelessnetworks $logicalAdapter | grep $wirelessSSID`
+				if [[ ! $hasCorpWireless ]]; then
+					/usr/sbin/networksetup -setairportnetwork $logicalAdapter $wirelessSSID
+					echo "$(timestamp) Adding $wirelessSSID to wi-fi adapter at $logicalAdapter..." >> $logFile
 				fi
 				if [[ $2 == "keepAlive" ]]; then
 					sleep 30
@@ -135,14 +136,14 @@ validateConnectivity () {
 		nc -z $hrSite 443 >/dev/null 2>&1
 		connectSuccess=$?
 		connectAttempts="0"
-		# Loop 5 times or until connectivity is verified; add bandsaw if it's not added, and give it 5 connection attempts after disabling/re-enabling airport	o
+		# Loop 5 times or until connectivity is verified; add corp wireless if it's not added, and give it 5 connection attempts after disabling/re-enabling airport	o
 		until [[ $connectSuccess == "0" || $connectAttempts == "5" ]]; do
 			if [[ $adapter == "Wi-Fi" ]]; then
 				echo "$(timestamp) Trying to connect to hrSite to validate a NAC'd connection..." >> $logFile
-				hasBandsaw=`/usr/sbin/networksetup -listpreferredwirelessnetworks $logicalAdapter| grep bandsaw`
-				if [[ ! $hasBandsaw ]]; then
-					/usr/sbin/networksetup -setairportnetwork $logicalAdapter bandsaw
-					echo "$(timestamp) Adding bandsaw to wi-fi adapter at $logicalAdapter..." >> $logFile
+				hasCorpWireless=`/usr/sbin/networksetup -listpreferredwirelessnetworks $logicalAdapter| grep $wirelessSSID`
+				if [[ ! $hasCorpWireless ]]; then
+					/usr/sbin/networksetup -setairportnetwork $logicalAdapter $wirelessSSID
+					echo "$(timestamp) Adding $wirelessSSID to wi-fi adapter at $logicalAdapter..." >> $logFile
 				fi
 				if [[ $2 == "keepAlive" ]]; then
 					sleep 30
@@ -260,7 +261,7 @@ removeMDM () {
 ## Deploy wireless network configuration if wireless adapter in use; Try to delete the AW certificates first
 if [[ $adapter = "Wi-Fi" ]]; then
 	
-	# Install the Casper-issued wireless config profile while still connected to bandsaw
+	# Install the Casper-issued wireless config profile while still connected to corp wireless
 	echo "$(timestamp) Adapter is $adapter. Installing wireless configuration profile..." >> $logFile
 	/usr/bin/profiles -I -F $wirelessNetworkConfigProfile >> $logFile
 	exitCode=$?
