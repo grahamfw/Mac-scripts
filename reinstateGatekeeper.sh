@@ -2,7 +2,8 @@
 #
 # This script will remove the Gatekeeper plist specified here.
 # It will also force an inventory run, which will put the user in a smart group
-# that reinstates Gatekeeper. Should be used in combination with the DisableGatekeeper framework.
+# that reinstates Gatekeeper. Should be used in combination with the DisableGatekeeper framework, which can
+# be found here: https://github.com/grahamfw/Mac-scripts/blob/master/DisableGatekeeper.sh
 #
 # Written by Graham Wells
 # graham.wells@gmail.com
