@@ -5,6 +5,7 @@
 # that reinstates Gatekeeper. Should be used in combination with the DisableGatekeeper framework.
 #
 # Written by Graham Wells
+# graham.wells@gmail.com
 # 09-12-2016
 #
 
